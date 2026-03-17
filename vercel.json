@@ -1,0 +1,13 @@
+{
+  "buildCommand": "cd agenda-vendedores-frontend && npm install && npm run build",
+  "outputDirectory": "agenda-vendedores-frontend/dist",
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index" }
+  ],
+  "functions": {
+    "api/index.py": {
+      "runtime": "@vercel/python@4.3.1",
+      "maxDuration": 30
+    }
+  }
+}
