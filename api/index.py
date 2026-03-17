@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
-import aiosqlite
+from typing import Optional, Dict
+import sqlite3
 import os
 import hashlib
 import secrets
+import traceback
 
 app = FastAPI()
 
@@ -26,7 +28,7 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "DAVID")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "david1402@")
 
 # In-memory session store: token -> {username, role}
-active_sessions: dict[str, dict[str, str]] = {}
+active_sessions: Dict[str, Dict[str, str]] = {}
 
 
 def hash_password(password: str) -> str:
@@ -64,18 +66,15 @@ class VisitUpdate(BaseModel):
     vendida: Optional[bool] = None
 
 
-async def get_db():
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
+def get_db() -> sqlite3.Connection:
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
     return db
 
 
-async def init_db():
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-    db = await get_db()
-    await db.execute("""
+def init_db():
+    db = get_db()
+    db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -84,7 +83,7 @@ async def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
-    await db.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS visitas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             vendedor TEXT NOT NULL,
@@ -98,34 +97,47 @@ async def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
-    cursor = await db.execute("SELECT id FROM users WHERE username = ?", (ADMIN_USER,))
-    existing = await cursor.fetchone()
+    cursor = db.execute("SELECT id FROM users WHERE username = ?", (ADMIN_USER,))
+    existing = cursor.fetchone()
     if not existing:
-        await db.execute(
+        db.execute(
             "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
             (ADMIN_USER, hash_password(ADMIN_PASS), "admin")
         )
-    await db.commit()
-    await db.close()
+    db.commit()
+    db.close()
 
 
 _db_initialized = False
 
 
-async def ensure_db():
+def ensure_db():
     global _db_initialized
     if not _db_initialized:
-        await init_db()
+        init_db()
         _db_initialized = True
 
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "traceback": traceback.format_exc()},
+    )
+
+
 @app.get("/api/healthz")
-async def healthz():
-    await ensure_db()
+def healthz():
     return {"status": "ok"}
 
 
-async def verify_token(request: Request) -> dict[str, str]:
+@app.get("/api/healthz/db")
+def healthz_db():
+    ensure_db()
+    return {"status": "ok", "db_path": DB_PATH}
+
+
+def verify_token(request: Request) -> Dict[str, str]:
     token = request.headers.get("X-Auth-Token", "")
     if not token:
         raise HTTPException(status_code=401, detail="No autorizado")
@@ -135,23 +147,23 @@ async def verify_token(request: Request) -> dict[str, str]:
     return session
 
 
-async def verify_admin(request: Request) -> dict[str, str]:
-    session = await verify_token(request)
+def verify_admin(request: Request) -> Dict[str, str]:
+    session = verify_token(request)
     if session["role"] != "admin":
         raise HTTPException(status_code=403, detail="Solo administradores pueden realizar esta accion")
     return session
 
 
 @app.post("/api/login")
-async def login(data: LoginRequest):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute(
+def login(data: LoginRequest):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute(
         "SELECT username, password_hash, role FROM users WHERE username = ?",
         (data.username,)
     )
-    user = await cursor.fetchone()
-    await db.close()
+    user = cursor.fetchone()
+    db.close()
     if not user or user["password_hash"] != hash_password(data.password):
         raise HTTPException(status_code=401, detail="Usuario o contrasena incorrectos")
     token = secrets.token_hex(32)
@@ -160,76 +172,76 @@ async def login(data: LoginRequest):
 
 
 @app.get("/api/users")
-async def listar_usuarios(session: dict = Depends(verify_admin)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute("SELECT id, username, role, created_at FROM users ORDER BY id")
-    rows = await cursor.fetchall()
+def listar_usuarios(session: dict = Depends(verify_admin)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute("SELECT id, username, role, created_at FROM users ORDER BY id")
+    rows = cursor.fetchall()
     users = [
         {"id": row["id"], "username": row["username"], "role": row["role"], "created_at": row["created_at"]}
         for row in rows
     ]
-    await db.close()
+    db.close()
     return users
 
 
 @app.post("/api/users")
-async def crear_usuario(user_data: UserCreate, session: dict = Depends(verify_admin)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute("SELECT id FROM users WHERE username = ?", (user_data.username,))
-    existing = await cursor.fetchone()
+def crear_usuario(user_data: UserCreate, session: dict = Depends(verify_admin)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute("SELECT id FROM users WHERE username = ?", (user_data.username,))
+    existing = cursor.fetchone()
     if existing:
-        await db.close()
+        db.close()
         raise HTTPException(status_code=400, detail="El usuario ya existe")
-    await db.execute(
+    db.execute(
         "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
         (user_data.username, hash_password(user_data.password), "vendedor")
     )
-    await db.commit()
-    await db.close()
+    db.commit()
+    db.close()
     return {"message": "Usuario vendedor creado exitosamente"}
 
 
 @app.delete("/api/users/{user_id}")
-async def eliminar_usuario(user_id: int, session: dict = Depends(verify_admin)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute("SELECT id, role FROM users WHERE id = ?", (user_id,))
-    user = await cursor.fetchone()
+def eliminar_usuario(user_id: int, session: dict = Depends(verify_admin)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute("SELECT id, role FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
     if not user:
-        await db.close()
+        db.close()
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
     if user["role"] == "admin":
-        await db.close()
+        db.close()
         raise HTTPException(status_code=400, detail="No se puede eliminar un administrador")
-    await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    await db.commit()
-    await db.close()
+    db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    db.commit()
+    db.close()
     return {"message": "Usuario eliminado exitosamente"}
 
 
 @app.post("/api/visitas")
-async def crear_visita(visita: VisitCreate, session: dict = Depends(verify_token)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute(
+def crear_visita(visita: VisitCreate, session: dict = Depends(verify_token)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute(
         """INSERT INTO visitas (vendedor, cliente, telefono, fecha, hora, direccion, notas)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (visita.vendedor, visita.cliente, visita.telefono, visita.fecha, visita.hora, visita.direccion, visita.notas)
     )
     visita_id = cursor.lastrowid
-    await db.commit()
-    await db.close()
+    db.commit()
+    db.close()
     return {"id": visita_id, "message": "Visita creada exitosamente"}
 
 
 @app.get("/api/visitas")
-async def listar_visitas(session: dict = Depends(verify_token)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute("SELECT * FROM visitas ORDER BY fecha DESC, hora DESC")
-    rows = await cursor.fetchall()
+def listar_visitas(session: dict = Depends(verify_token)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute("SELECT * FROM visitas ORDER BY fecha DESC, hora DESC")
+    rows = cursor.fetchall()
     visitas = []
     for row in rows:
         visitas.append({
@@ -244,17 +256,17 @@ async def listar_visitas(session: dict = Depends(verify_token)):
             "vendida": bool(row["vendida"]),
             "created_at": row["created_at"],
         })
-    await db.close()
+    db.close()
     return visitas
 
 
 @app.get("/api/visitas/{visita_id}")
-async def obtener_visita(visita_id: int, session: dict = Depends(verify_token)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute("SELECT * FROM visitas WHERE id = ?", (visita_id,))
-    row = await cursor.fetchone()
-    await db.close()
+def obtener_visita(visita_id: int, session: dict = Depends(verify_token)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute("SELECT * FROM visitas WHERE id = ?", (visita_id,))
+    row = cursor.fetchone()
+    db.close()
     if not row:
         raise HTTPException(status_code=404, detail="Visita no encontrada")
     return {
@@ -272,13 +284,13 @@ async def obtener_visita(visita_id: int, session: dict = Depends(verify_token)):
 
 
 @app.patch("/api/visitas/{visita_id}")
-async def actualizar_visita(visita_id: int, visita: VisitUpdate, session: dict = Depends(verify_admin)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute("SELECT * FROM visitas WHERE id = ?", (visita_id,))
-    existing = await cursor.fetchone()
+def actualizar_visita(visita_id: int, visita: VisitUpdate, session: dict = Depends(verify_admin)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute("SELECT * FROM visitas WHERE id = ?", (visita_id,))
+    existing = cursor.fetchone()
     if not existing:
-        await db.close()
+        db.close()
         raise HTTPException(status_code=404, detail="Visita no encontrada")
     updates = {}
     for field, value in visita.model_dump(exclude_unset=True).items():
@@ -287,38 +299,38 @@ async def actualizar_visita(visita_id: int, visita: VisitUpdate, session: dict =
         set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
         values = list(updates.values())
         values.append(visita_id)
-        await db.execute(f"UPDATE visitas SET {set_clause} WHERE id = ?", values)
-        await db.commit()
-    await db.close()
+        db.execute(f"UPDATE visitas SET {set_clause} WHERE id = ?", values)
+        db.commit()
+    db.close()
     return {"message": "Visita actualizada exitosamente"}
 
 
 @app.delete("/api/visitas/{visita_id}")
-async def eliminar_visita(visita_id: int, session: dict = Depends(verify_admin)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute("SELECT * FROM visitas WHERE id = ?", (visita_id,))
-    existing = await cursor.fetchone()
+def eliminar_visita(visita_id: int, session: dict = Depends(verify_admin)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute("SELECT * FROM visitas WHERE id = ?", (visita_id,))
+    existing = cursor.fetchone()
     if not existing:
-        await db.close()
+        db.close()
         raise HTTPException(status_code=404, detail="Visita no encontrada")
-    await db.execute("DELETE FROM visitas WHERE id = ?", (visita_id,))
-    await db.commit()
-    await db.close()
+    db.execute("DELETE FROM visitas WHERE id = ?", (visita_id,))
+    db.commit()
+    db.close()
     return {"message": "Visita eliminada exitosamente"}
 
 
 @app.patch("/api/visitas/{visita_id}/vendida")
-async def marcar_vendida(visita_id: int, session: dict = Depends(verify_admin)):
-    await ensure_db()
-    db = await get_db()
-    cursor = await db.execute("SELECT * FROM visitas WHERE id = ?", (visita_id,))
-    existing = await cursor.fetchone()
+def marcar_vendida(visita_id: int, session: dict = Depends(verify_admin)):
+    ensure_db()
+    db = get_db()
+    cursor = db.execute("SELECT * FROM visitas WHERE id = ?", (visita_id,))
+    existing = cursor.fetchone()
     if not existing:
-        await db.close()
+        db.close()
         raise HTTPException(status_code=404, detail="Visita no encontrada")
     new_value = not bool(existing["vendida"])
-    await db.execute("UPDATE visitas SET vendida = ? WHERE id = ?", (new_value, visita_id))
-    await db.commit()
-    await db.close()
+    db.execute("UPDATE visitas SET vendida = ? WHERE id = ?", (new_value, visita_id))
+    db.commit()
+    db.close()
     return {"vendida": new_value, "message": "Estado de venta actualizado"}
